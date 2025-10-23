@@ -4,6 +4,7 @@ import morgan from 'morgan';
 import { fetch } from 'undici';
 import * as cheerio from 'cheerio';
 import { z } from 'zod';
+import he from 'he';
 
 // ---------- Tiny recipe schema (what we return) ----------
 const RecipeSchema = z.object({
@@ -118,6 +119,22 @@ const getDomain = (url) => {
   }
 };
 
+// decode helper for any text we keep
+const decode = (s) => (typeof s === 'string' ? he.decode(s) : s);
+
+// uppercase-heading / section labels like "FOR THE GRILL"
+const isShoutyHeading = (s) => {
+  if (!s) return false;
+  const t = s.trim();
+  const words = t.split(/\s+/);
+  if (words.length <= 4) {
+    const letters = t.replace(/[^A-Za-z]/g, '');
+    // "mostly uppercase" and looks like a section label
+    if (letters && letters === letters.toUpperCase()) return true;
+  }
+  return /^for the\b/i.test(t) || /^serv(e|ing)s\b/i.test(t);
+};
+
 // very small units list to normalize e.g. "tbs", "tbsp." → "tbsp"
 const UNIT_ALIASES = new Map([
   ['t', 'tsp'],
@@ -147,29 +164,39 @@ const UNIT_ALIASES = new Map([
   ['ounce', 'oz'],
   ['ounces', 'oz'],
   ['lb', 'lb'],
+  ['lbs', 'lb'],
   ['pound', 'lb'],
   ['pounds', 'lb'],
+  ['clove', 'clove'],
+  ['cloves', 'clove'],
+  ['can', 'can'],
+  ['cans', 'can'],
+  ['pinch', 'pinch'],
+  ['pinches', 'pinch'],
+  ['bunch', 'bunch'],
+  ['bunches', 'bunch'],
+  ['slice', 'slice'],
+  ['slices', 'slice'],
 ]);
 
 const normalizeUnit = (u) => {
   if (!u) return null;
   const key = u.toLowerCase().replace(/\.$/, '');
-  return UNIT_ALIASES.get(key) || u;
+  return UNIT_ALIASES.get(key) || key; // fall back to the raw token lowercased
 };
 
 // Parse an ingredient line like "1 1/2 cups flour" or "2 tbsp olive oil, divided"
 function parseIngredientLine(line) {
-  const original = line.trim().replace(/\s+/g, ' ');
+  const original = decode(line.trim().replace(/\s+/g, ' '));
   if (!original) return null;
 
-  // capture mixed fractions (e.g. 1 1/2), simple fractions (1/2), or decimals
-  const qtyMatch = original.match(/^(\d+\s+\d+\/\d+|\d+\/\d+|\d+(\.\d+)?)/);
+  // qty: mixed fraction, simple fraction, or decimal
+  const qtyMatch = original.match(/^(\d+\s+\d+\/\d+|\d+\/\d+|\d+(?:\.\d+)?)/);
   let quantity = null;
   let rest = original;
   if (qtyMatch) {
     const q = qtyMatch[1];
     if (q.includes('/')) {
-      // "1 1/2" or "1/2"
       const parts = q.split(' ');
       if (parts.length === 2) {
         const whole = parseFloat(parts[0]);
@@ -182,44 +209,55 @@ function parseIngredientLine(line) {
     } else {
       quantity = parseFloat(q);
     }
-    rest = original.slice(qtyMatch[0].length).trim();
+    rest = rest.slice(qtyMatch[0].length).trim();
   }
 
-  // try to read a unit next
-  const unitMatch = rest.match(/^([a-zA-Z\.]+)\b/);
+  // Try to read unit: look at first token; allow plurals and dot suffixes
   let unit = null;
-  if (unitMatch) {
-    unit = normalizeUnit(unitMatch[1]);
-    // Only treat it as a unit if it’s a known/likely one (basic heuristic)
-    if (
-      !UNIT_ALIASES.has(unitMatch[1].toLowerCase().replace(/\.$/, '')) &&
-      ![
-        'g',
-        'kg',
-        'ml',
-        'l',
-        'cup',
-        'cups',
-        'oz',
-        'lb',
-        'tsp',
-        'tbsp',
-      ].includes(unit)
-    ) {
-      unit = null; // probably part of the item (e.g., "large")
-    } else {
-      rest = rest.slice(unitMatch[0].length).trim();
+  let item = rest;
+  let note = null;
+
+  if (rest) {
+    const tokMatch = rest.match(/^([a-zA-Z\.]+)\b/);
+    if (tokMatch) {
+      const maybeUnitRaw = tokMatch[1];
+      const maybeUnit = normalizeUnit(maybeUnitRaw);
+      if (
+        UNIT_ALIASES.has(maybeUnitRaw.toLowerCase().replace(/\.$/, '')) ||
+        [
+          'g',
+          'kg',
+          'ml',
+          'l',
+          'cup',
+          'oz',
+          'lb',
+          'tsp',
+          'tbsp',
+          'clove',
+          'can',
+          'pinch',
+          'bunch',
+          'slice',
+        ].includes(maybeUnit)
+      ) {
+        unit = maybeUnit;
+        item = rest.slice(tokMatch[0].length).trim();
+      }
     }
   }
 
-  // split trailing note by comma "olive oil, divided"
-  let item = rest;
-  let note = null;
-  const comma = rest.indexOf(',');
-  if (comma !== -1) {
-    item = rest.slice(0, comma).trim();
-    note = rest.slice(comma + 1).trim();
+  // Comma → note split
+  if (item) {
+    const comma = item.indexOf(',');
+    if (comma !== -1) {
+      note = item.slice(comma + 1).trim() || null;
+      item = item.slice(0, comma).trim();
+    }
   }
+
+  // Clean trivial “of” after units, e.g. "cups of flour" → "flour"
+  if (item && /^of\s+/i.test(item)) item = item.replace(/^of\s+/i, '');
 
   return {
     original,
@@ -234,8 +272,9 @@ function parseIngredientLine(line) {
 function normalizeSteps(arr) {
   const steps = (arr || [])
     .map((s) => (typeof s === 'string' ? s : s?.text || ''))
-    .map((s) => s.trim())
+    .map((s) => decode(s.trim()))
     .filter(Boolean)
+    .filter((s) => !isShoutyHeading(s))
     .map((text, i) => ({ n: i + 1, text }));
   return steps;
 }
@@ -342,8 +381,9 @@ function extractHeuristics($) {
 
 // Normalize a JSON-LD recipe object to our schema
 function normalizeFromJSONLD(obj, sourceUrl) {
-  const title = toStringCoerce(obj.name);
-  const description = toStringCoerce(obj.description);
+  // CHANGED: decode title/description (uses the `decode` helper from `he`)
+  const title = decode(toStringCoerce(obj.name)); // CHANGED
+  const description = decode(toStringCoerce(obj.description)); // CHANGED
 
   // image can be string | {url} | string[] | object[]
   let image = null;
@@ -364,15 +404,20 @@ function normalizeFromJSONLD(obj, sourceUrl) {
   else if (obj.author && typeof obj.author === 'object')
     author = obj.author.name || null;
 
-  // recipeYield can be number | string | array | object
-  const yieldOriginal = toStringCoerce(obj.recipeYield);
+  // CHANGED: coerce + tidy raw yield text (e.g., "4 4 people" -> "4 people")
+  const rawYield = toStringCoerce(obj.recipeYield); // CHANGED
+  const yieldOriginal = rawYield
+    ? rawYield.replace(/\b(\d+)\s+\1\b/, '$1').trim()
+    : null; // CHANGED
+
+  // CHANGED: derive servings from the cleaned yieldOriginal
   let servings = null;
   if (typeof obj.recipeYield === 'number') {
     servings = obj.recipeYield;
   } else {
-    const m = toStringCoerce(obj.recipeYield)?.match(
-      /(\d+)\s*(servings|serves|portion|portions)?/i,
-    );
+    const m = yieldOriginal?.match(
+      /(\d+)\s*(servings?|serves?|people|portion|portions)?/i,
+    ); // CHANGED
     if (m) servings = parseInt(m[1], 10);
   }
 
@@ -383,11 +428,7 @@ function normalizeFromJSONLD(obj, sourceUrl) {
     minutesFromISO8601Duration(obj.totalTime) ??
     ((prep ?? 0) + (cook ?? 0) || null);
 
-  // instructions may be:
-  // - string with newlines
-  // - array of strings
-  // - array of HowToStep objects ({text|name})
-  // - array of HowToSection objects ({itemListElement:[HowToStep...]})
+  // instructions may be: string | array of strings | HowToStep[] | HowToSection[]
   let stepStrings = [];
   const inst = obj.recipeInstructions;
   if (typeof inst === 'string') {
@@ -430,6 +471,7 @@ function normalizeFromJSONLD(obj, sourceUrl) {
     .map((s) => parseIngredientLine(String(s)))
     .filter(Boolean);
 
+  // NOTE: if your normalizeSteps already decodes entities, you don't need to decode here.
   const steps = normalizeSteps(stepStrings);
 
   // tags from keywords/category/cuisine; each can be string | array
@@ -444,7 +486,7 @@ function normalizeFromJSONLD(obj, sourceUrl) {
     description: description || null,
     image: image || null,
     author: author || null,
-    yield: { servings: servings ?? null, original: yieldOriginal || null },
+    yield: { servings: servings ?? null, original: yieldOriginal || null }, // CHANGED (uses cleaned yieldOriginal)
     time: {
       prep: clampInt(prep),
       cook: clampInt(cook),
