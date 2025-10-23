@@ -46,3 +46,6 @@ export const RecipeSchema = z.object({
   }),
   llmNotes: z.any().optional().nullable(),
 });
+
+export type Recipe = z.infer<typeof RecipeSchema>;
+export type Ingredient = Recipe['ingredients'][number];

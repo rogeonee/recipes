@@ -1,10 +1,12 @@
 import he from 'he';
+import type { Ingredient, Recipe } from './recipe-schema.js';
 
-export const decode = (s) => (typeof s === 'string' ? he.decode(s) : s);
+export const decode = <T>(s: T): T | string =>
+  typeof s === 'string' ? he.decode(s) : s;
 
-export const minutesFromISO8601Duration = (dur) => {
+export const minutesFromISO8601Duration = (dur: unknown): number | null => {
   const pick = Array.isArray(dur)
-    ? dur.find((s) => typeof s === 'string' && /P(T|$)/i.test(s))
+    ? dur.find((s): s is string => typeof s === 'string' && /P(T|$)/i.test(s))
     : dur;
   if (!pick || typeof pick !== 'string') return null;
   const m = pick.match(
@@ -25,7 +27,7 @@ export const minutesFromISO8601Duration = (dur) => {
   );
 };
 
-export const toStringCoerce = (v) => {
+export const toStringCoerce = (v: unknown): string | null => {
   if (v == null) return null;
   if (typeof v === 'string') return v;
   if (typeof v === 'number') return String(v);
@@ -33,41 +35,62 @@ export const toStringCoerce = (v) => {
     const parts = v
       .map((x) => {
         if (typeof x === 'string') return x;
-        if (x && typeof x === 'object') return x.name || x.text || '';
+        if (x && typeof x === 'object') {
+          const node = x as Record<string, unknown>;
+          const byName = node.name;
+          if (typeof byName === 'string') return byName;
+          const byText = node.text;
+          if (typeof byText === 'string') return byText;
+        }
         return '';
       })
       .filter(Boolean);
     return parts.length ? parts.join(' ') : null;
   }
-  if (typeof v === 'object') return v.name || v.text || null;
+  if (typeof v === 'object') {
+    const obj = v as Record<string, unknown>;
+    const byName = obj.name;
+    if (typeof byName === 'string') return byName;
+    const byText = obj.text;
+    if (typeof byText === 'string') return byText;
+    return null;
+  }
   return null;
 };
 
-export const toStringArray = (v) => {
+export const toStringArray = (v: unknown): string[] => {
   if (!v) return [];
   if (Array.isArray(v)) {
     return v
       .flatMap((x) => {
         if (typeof x === 'string') return [x];
-        if (x && typeof x === 'object') return [x.text || x.name || ''];
+        if (x && typeof x === 'object') {
+          const node = x as Record<string, unknown>;
+          const fromText = node.text;
+          if (typeof fromText === 'string') return [fromText];
+          const fromName = node.name;
+          if (typeof fromName === 'string') return [fromName];
+        }
         return [];
       })
       .map((s) => s.trim())
-      .filter(Boolean);
+      .filter((s): s is string => Boolean(s));
   }
   if (typeof v === 'string') {
     return v
       .split(/,|\n/)
       .map((s) => s.trim())
-      .filter(Boolean);
+      .filter((s): s is string => Boolean(s));
   }
   return [];
 };
 
-export const clampInt = (n) =>
-  Number.isFinite(n) ? Math.max(0, Math.round(n)) : null;
+export const clampInt = (n: unknown): number | null => {
+  if (typeof n !== 'number' || !Number.isFinite(n)) return null;
+  return Math.max(0, Math.round(n));
+};
 
-export const getDomain = (url) => {
+export const getDomain = (url: string): string | undefined => {
   try {
     return new URL(url).hostname;
   } catch {
@@ -75,7 +98,7 @@ export const getDomain = (url) => {
   }
 };
 
-const UNIT_ALIASES = new Map([
+const UNIT_ALIASES = new Map<string, string>([
   ['t', 'tsp'],
   ['ts', 'tsp'],
   ['tsp.', 'tsp'],
@@ -118,13 +141,13 @@ const UNIT_ALIASES = new Map([
   ['slices', 'slice'],
 ]);
 
-const normalizeUnit = (u) => {
+const normalizeUnit = (u: string | null | undefined): string | null => {
   if (!u) return null;
   const key = u.toLowerCase().replace(/\.$/, '');
   return UNIT_ALIASES.get(key) || key;
 };
 
-const UNICODE_FRACTIONS = new Map([
+const UNICODE_FRACTIONS = new Map<string, string>([
   ['½', '1/2'],
   ['⅓', '1/3'],
   ['⅔', '2/3'],
@@ -142,14 +165,10 @@ const UNICODE_FRACTIONS = new Map([
   ['⅞', '7/8'],
 ]);
 
-const replaceUnicodeFractions = (str) =>
-  str.replace(
-    /[½⅓⅔¼¾⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞]/g,
-    (ch) => UNICODE_FRACTIONS.get(ch) || ch,
-  );
+const replaceUnicodeFractions = (str: string): string =>
+  str.replace(/[½⅓⅔¼¾⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞]/g, (ch) => UNICODE_FRACTIONS.get(ch) || ch);
 
-const numberPattern =
-  '(?:\\d+\\s+\\d+/\\d+|\\d+/\\d+|\\d*\\.\\d+|\\d+)';
+const numberPattern = '(?:\\d+\\s+\\d+/\\d+|\\d+/\\d+|\\d*\\.\\d+|\\d+)';
 
 const rangeRegex = new RegExp(
   `^(${numberPattern})\\s*(?:-|–|—|to)\\s*(${numberPattern})`,
@@ -158,7 +177,7 @@ const rangeRegex = new RegExp(
 
 const singleNumberRegex = new RegExp(`^(${numberPattern})`);
 
-const parseNumericToken = (token) => {
+const parseNumericToken = (token: string | null | undefined): number | null => {
   if (!token) return null;
   const trimmed = token.trim();
   if (!trimmed) return null;
@@ -180,15 +199,20 @@ const parseNumericToken = (token) => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
-export function parseIngredientLine(line) {
-  const original = decode(line.trim().replace(/\s+/g, ' '));
+export function parseIngredientLine(line: string): Ingredient | null {
+  const compact = line.trim().replace(/\s+/g, ' ');
+  if (!compact) return null;
+
+  const decoded = decode(compact);
+  const original =
+    typeof decoded === 'string' ? decoded : String(decoded ?? '').trim();
   if (!original) return null;
 
   const prepared = replaceUnicodeFractions(original).replace(/[−–—]/g, '-');
 
   let rest = prepared;
-  let quantity = null;
-  const noteParts = [];
+  let quantity: number | null = null;
+  const noteParts: string[] = [];
 
   const rangeMatch = rest.match(rangeRegex);
   if (rangeMatch) {
@@ -223,32 +247,34 @@ export function parseIngredientLine(line) {
     }
   }
 
-  let unit = null;
-  let item = rest;
+  let unit: string | null = null;
+  let item: string | null = rest;
 
   if (rest) {
     const tokMatch = rest.match(/^([a-zA-Z\.]+)\b/);
     if (tokMatch) {
       const maybeUnitRaw = tokMatch[1];
       const maybeUnit = normalizeUnit(maybeUnitRaw);
+      const canonicalKey = maybeUnitRaw.toLowerCase().replace(/\.$/, '');
       if (
-        UNIT_ALIASES.has(maybeUnitRaw.toLowerCase().replace(/\.$/, '')) ||
-        [
-          'g',
-          'kg',
-          'ml',
-          'l',
-          'cup',
-          'oz',
-          'lb',
-          'tsp',
-          'tbsp',
-          'clove',
-          'can',
-          'pinch',
-          'bunch',
-          'slice',
-        ].includes(maybeUnit)
+        maybeUnit &&
+        (UNIT_ALIASES.has(canonicalKey) ||
+          [
+            'g',
+            'kg',
+            'ml',
+            'l',
+            'cup',
+            'oz',
+            'lb',
+            'tsp',
+            'tbsp',
+            'clove',
+            'can',
+            'pinch',
+            'bunch',
+            'slice',
+          ].includes(maybeUnit))
       ) {
         unit = maybeUnit;
         item = rest.slice(tokMatch[0].length).trim();
@@ -282,7 +308,10 @@ export function parseIngredientLine(line) {
     if (starMatch) {
       item = item.slice(0, starMatch.index).trim();
     }
-    item = item.replace(/^[\s\-–—.,]+/, '').replace(/[\s(]+$/, '').trim();
+    item = item
+      .replace(/^[\s\-–—.,]+/, '')
+      .replace(/[\s(]+$/, '')
+      .trim();
   }
 
   const note =
@@ -294,7 +323,7 @@ export function parseIngredientLine(line) {
           .replace(/[\s)]+$/, '')
           .trim(),
       )
-      .filter(Boolean)
+      .filter((n): n is string => Boolean(n))
       .join('; ') || null;
 
   return {
@@ -306,7 +335,7 @@ export function parseIngredientLine(line) {
   };
 }
 
-export const isShoutyHeading = (s) => {
+export const isShoutyHeading = (s: string | null | undefined): s is string => {
   if (!s) return false;
   const t = s.trim();
   const words = t.split(/\s+/);
@@ -317,11 +346,18 @@ export const isShoutyHeading = (s) => {
   return /^for the\b/i.test(t) || /^serv(e|ing)s\b/i.test(t);
 };
 
-export function normalizeSteps(arr) {
-  const steps = (arr || [])
-    .map((s) => (typeof s === 'string' ? s : s?.text || ''))
-    .map((s) => decode(s.trim()))
-    .filter(Boolean)
+type StepLike = string | { text?: string | null };
+
+export function normalizeSteps(
+  arr: ReadonlyArray<StepLike> | null | undefined,
+): Recipe['steps'] {
+  const steps = (arr ?? [])
+    .map((s) => (typeof s === 'string' ? s : s?.text ?? ''))
+    .map((s) => {
+      const decoded = decode(s.trim());
+      return typeof decoded === 'string' ? decoded : String(decoded ?? '');
+    })
+    .filter((s): s is string => Boolean(s))
     .filter((s) => !isShoutyHeading(s))
     .map((text, i) => ({ n: i + 1, text }));
   return steps;

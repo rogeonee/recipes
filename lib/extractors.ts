@@ -1,6 +1,24 @@
+import type { CheerioAPI } from 'cheerio';
+
 const TYPE_RECIPE_RE = /schema\.org\/recipe/i;
 
-const simplifyTypes = (typeAttr) =>
+export type StructuredRecipeNode = Record<string, unknown>;
+
+export type HeuristicExtraction = {
+  title: string | null;
+  image: string | null;
+  ingredients: string[];
+  steps: string[];
+};
+
+type ElementNode = {
+  attribs?: Record<string, string | undefined>;
+  name?: string;
+  children?: ElementNode[];
+  type?: string;
+};
+
+const simplifyTypes = (typeAttr: string): string[] =>
   typeAttr
     .split(/\s+/)
     .map((t) => t.trim())
@@ -10,51 +28,66 @@ const simplifyTypes = (typeAttr) =>
       return parts[parts.length - 1] || t;
     });
 
-function collectItemscope($, scopeEl) {
-  const typeAttr = scopeEl.attribs?.itemtype || '';
+function collectItemscope(
+  $: CheerioAPI,
+  scopeEl: ElementNode,
+): StructuredRecipeNode {
+  const typeAttr = scopeEl.attribs?.itemtype ?? '';
   const types = simplifyTypes(typeAttr);
-  const data = {};
+  const data: StructuredRecipeNode = {};
   if (types.length) {
     data['@type'] = types.length === 1 ? types[0] : types;
   }
 
-  const addValue = (prop, value) => {
+  const addValue = (prop: string, value: unknown) => {
     if (value == null) return;
-    if (data[prop] === undefined) {
+    const existing = data[prop];
+    if (existing === undefined) {
       data[prop] = value;
-    } else if (Array.isArray(data[prop])) {
-      data[prop].push(value);
+    } else if (Array.isArray(existing)) {
+      existing.push(value);
     } else {
-      data[prop] = [data[prop], value];
+      data[prop] = [existing, value];
     }
   };
 
-  const readValue = (node) => {
-    const attribs = node.attribs || {};
-    const name = node.name?.toLowerCase() || '';
+  const readValue = (
+    node: ElementNode,
+  ): string | StructuredRecipeNode | null => {
+    const attribs = node.attribs ?? {};
+    const name = node.name?.toLowerCase() ?? '';
     if (attribs.content) return attribs.content.trim();
     if (name === 'meta') return attribs.content?.trim() ?? null;
-    if (name === 'time') return attribs.datetime || $(node).text().trim();
-    if (name === 'link') return attribs.href || null;
-    if (['img', 'source'].includes(name)) return attribs.src || null;
+    if (name === 'time')
+      return (
+        attribs.datetime ??
+        $(node as any)
+          .text()
+          .trim()
+      );
+    if (name === 'link') return attribs.href ?? null;
+    if (['img', 'source'].includes(name)) return attribs.src ?? null;
     if (attribs.href && ['a', 'area'].includes(name)) return attribs.href;
-    const text = $(node).text().trim();
+    const text = $(node as any)
+      .text()
+      .trim();
     return text || null;
   };
 
-  const traverse = (node) => {
-    if (!node || !node.children) return;
+  const traverse = (node: ElementNode | null | undefined) => {
+    if (!node?.children) return;
     for (const child of node.children) {
       if (child.type !== 'tag') continue;
-      const prop = child.attribs?.itemprop;
-      const hasScope = 'itemscope' in (child.attribs || {});
+      const element = child as ElementNode;
+      const prop = element.attribs?.itemprop;
+      const hasScope = 'itemscope' in (element.attribs || {});
       if (prop) {
         const value = hasScope
-          ? collectItemscope($, child)
-          : readValue(child);
+          ? collectItemscope($, element)
+          : readValue(element);
         addValue(prop, value);
       }
-      if (!hasScope) traverse(child);
+      if (!hasScope) traverse(element);
     }
   };
 
@@ -74,8 +107,10 @@ function collectItemscope($, scopeEl) {
   return data;
 }
 
-export function extractJSONLDRecipe($) {
-  const blocks = [];
+export function extractJSONLDRecipe(
+  $: CheerioAPI,
+): StructuredRecipeNode | null {
+  const blocks: unknown[] = [];
   $('script[type="application/ld+json"]').each((_, el) => {
     const raw = $(el).contents().text();
     try {
@@ -86,23 +121,22 @@ export function extractJSONLDRecipe($) {
     }
   });
 
-  const collect = (node) => {
+  const collect = (node: unknown): StructuredRecipeNode[] => {
     if (!node) return [];
     if (Array.isArray(node)) return node.flatMap(collect);
     if (typeof node === 'object') {
-      const types = Array.isArray(node['@type'])
-        ? node['@type']
-        : node['@type']
-        ? [node['@type']]
-        : [];
+      const obj = node as StructuredRecipeNode;
+      const typeRaw = obj['@type'];
+      const types = Array.isArray(typeRaw) ? typeRaw : typeRaw ? [typeRaw] : [];
       const isRecipe = types?.some?.((t) =>
         String(t).toLowerCase().includes('recipe'),
       );
-      const inGraph = Array.isArray(node['@graph'])
-        ? node['@graph'].flatMap(collect)
+      const graphRaw = obj['@graph'];
+      const inGraph = Array.isArray(graphRaw)
+        ? (graphRaw as unknown[]).flatMap(collect)
         : [];
-      const children = Object.values(node).flatMap(collect);
-      return (isRecipe ? [node] : []).concat(inGraph, children);
+      const children = Object.values(obj).flatMap(collect);
+      return (isRecipe ? [obj] : []).concat(inGraph, children);
     }
     return [];
   };
@@ -111,10 +145,12 @@ export function extractJSONLDRecipe($) {
   return recipes[0] || null;
 }
 
-export function extractMicrodataRecipe($) {
+export function extractMicrodataRecipe(
+  $: CheerioAPI,
+): StructuredRecipeNode | null {
   const scopes = $('[itemscope][itemtype]');
-  for (const el of scopes.toArray()) {
-    const typeAttr = el.attribs?.itemtype || '';
+  for (const el of scopes.toArray() as ElementNode[]) {
+    const typeAttr = el.attribs?.itemtype ?? '';
     if (!TYPE_RECIPE_RE.test(typeAttr)) continue;
     const recipe = collectItemscope($, el);
     if (recipe) return recipe;
@@ -122,7 +158,7 @@ export function extractMicrodataRecipe($) {
   return null;
 }
 
-export function extractHeuristics($) {
+export function extractHeuristics($: CheerioAPI): HeuristicExtraction {
   const title =
     $('h1[itemprop="name"]').first().text().trim() ||
     $('h1').first().text().trim() ||
@@ -137,7 +173,7 @@ export function extractHeuristics($) {
     '.recipe-ingredients li',
     '.ingredients p',
   ];
-  let ingredients = [];
+  let ingredients: string[] = [];
   for (const sel of ingredientCandidates) {
     const list = $(sel)
       .map((_, el) => $(el).text().trim())
@@ -161,7 +197,7 @@ export function extractHeuristics($) {
     '.recipe-steps li',
     '.recipe-steps p',
   ];
-  let stepsText = [];
+  let stepsText: string[] = [];
   for (const sel of stepCandidates) {
     const list = $(sel)
       .map((_, el) => $(el).text().trim())

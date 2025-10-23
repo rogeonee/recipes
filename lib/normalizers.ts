@@ -1,4 +1,9 @@
 import { RecipeSchema } from './recipe-schema.js';
+import type { Ingredient, Recipe } from './recipe-schema.js';
+import type {
+  HeuristicExtraction,
+  StructuredRecipeNode,
+} from './extractors.js';
 import {
   clampInt,
   decode,
@@ -10,9 +15,9 @@ import {
   toStringCoerce,
 } from './recipe-utils.js';
 
-const METRIC_UNITS = new Set(['g', 'kg', 'ml', 'l']);
-const US_UNITS = new Set(['cup', 'oz', 'lb']);
-const NEUTRAL_UNITS = new Set([
+const METRIC_UNITS = new Set<string>(['g', 'kg', 'ml', 'l']);
+const US_UNITS = new Set<string>(['cup', 'oz', 'lb']);
+const NEUTRAL_UNITS = new Set<string>([
   'tsp',
   'tbsp',
   'pinch',
@@ -22,11 +27,13 @@ const NEUTRAL_UNITS = new Set([
   'can',
 ]);
 
-const inferUnitsFromIngredients = (ingredients) => {
+const inferUnitsFromIngredients = (
+  ingredients: Ingredient[],
+): 'metric' | 'us' => {
   const units = ingredients
     .map((ing) => ing.unit)
     .filter(Boolean)
-    .map((u) => u.toLowerCase());
+    .map((u) => u!.toLowerCase());
   if (units.length === 0) return 'metric';
 
   const metricOnly = units.every(
@@ -41,35 +48,43 @@ const inferUnitsFromIngredients = (ingredients) => {
   return 'metric';
 };
 
-export function normalizeFromJSONLD(obj, sourceUrl) {
-  const title = decode(toStringCoerce(obj.name));
-  const description = decode(toStringCoerce(obj.description));
+export function normalizeFromJSONLD(
+  obj: StructuredRecipeNode,
+  sourceUrl: string,
+): Recipe {
+  const title = decode(toStringCoerce(obj['name']));
+  const description = decode(toStringCoerce(obj['description']));
 
   let image = null;
-  const imgRaw = obj.image;
+  const imgRaw = obj['image'];
   if (Array.isArray(imgRaw)) {
     const first = imgRaw[0];
-    image = typeof first === 'string' ? first : first?.url || null;
+    image =
+      typeof first === 'string'
+        ? first
+        : (first as StructuredRecipeNode | undefined)?.url || null;
   } else if (typeof imgRaw === 'string') {
     image = imgRaw;
   } else if (imgRaw && typeof imgRaw === 'object') {
-    image = imgRaw.url || null;
+    image = (imgRaw as StructuredRecipeNode).url || null;
   }
 
   let author = null;
-  if (typeof obj.author === 'string') author = obj.author;
-  else if (Array.isArray(obj.author)) author = obj.author[0]?.name || null;
-  else if (obj.author && typeof obj.author === 'object')
-    author = obj.author.name || null;
+  const authorRaw = obj['author'];
+  if (typeof authorRaw === 'string') author = authorRaw;
+  else if (Array.isArray(authorRaw))
+    author = (authorRaw[0] as StructuredRecipeNode | undefined)?.name || null;
+  else if (authorRaw && typeof authorRaw === 'object')
+    author = (authorRaw as StructuredRecipeNode).name || null;
 
-  const rawYield = toStringCoerce(obj.recipeYield);
+  const rawYield = toStringCoerce(obj['recipeYield']);
   const yieldOriginal = rawYield
     ? rawYield.replace(/\b(\d+)\s+\1\b/, '$1').trim()
     : null;
 
   let servings = null;
-  if (typeof obj.recipeYield === 'number') {
-    servings = obj.recipeYield;
+  if (typeof obj['recipeYield'] === 'number') {
+    servings = obj['recipeYield'];
   } else {
     const m = yieldOriginal?.match(
       /(\d+)\s*(servings?|serves?|people|portion|portions)?/i,
@@ -77,34 +92,40 @@ export function normalizeFromJSONLD(obj, sourceUrl) {
     if (m) servings = parseInt(m[1], 10);
   }
 
-  const prep = minutesFromISO8601Duration(obj.prepTime) ?? null;
-  const cook = minutesFromISO8601Duration(obj.cookTime) ?? null;
+  const prep = minutesFromISO8601Duration(obj['prepTime']) ?? null;
+  const cook = minutesFromISO8601Duration(obj['cookTime']) ?? null;
   const total =
-    minutesFromISO8601Duration(obj.totalTime) ??
+    minutesFromISO8601Duration(obj['totalTime']) ??
     ((prep ?? 0) + (cook ?? 0) || null);
 
-  let stepStrings = [];
-  const inst = obj.recipeInstructions;
+  let stepStrings: string[] = [];
+  const inst = obj['recipeInstructions'];
   if (typeof inst === 'string') {
     stepStrings = inst
       .split(/\n+|\r+/)
       .map((s) => s.trim())
       .filter(Boolean);
   } else if (Array.isArray(inst)) {
-    const collect = [];
+    const collect: string[] = [];
     for (const step of inst) {
       if (typeof step === 'string') {
         collect.push(step);
       } else if (step && typeof step === 'object') {
-        const t = step.text || step.name;
+        const node = step as StructuredRecipeNode;
+        const t =
+          (node.text as string | undefined) ??
+          (node.name as string | undefined);
         if (t) collect.push(t);
-        const list = Array.isArray(step.itemListElement)
-          ? step.itemListElement
+        const list = Array.isArray(node.itemListElement)
+          ? (node.itemListElement as unknown[])
           : [];
         for (const li of list) {
           if (typeof li === 'string') collect.push(li);
           else if (li && typeof li === 'object') {
-            const lt = li.text || li.name;
+            const liNode = li as StructuredRecipeNode;
+            const lt =
+              (liNode.text as string | undefined) ??
+              (liNode.name as string | undefined);
             if (lt) collect.push(lt);
           }
         }
@@ -113,22 +134,22 @@ export function normalizeFromJSONLD(obj, sourceUrl) {
     stepStrings = collect.filter(Boolean);
   }
 
-  const ingStrings = Array.isArray(obj.recipeIngredient)
-    ? obj.recipeIngredient
-    : Array.isArray(obj.ingredients)
-    ? obj.ingredients
+  const ingStrings = Array.isArray(obj['recipeIngredient'])
+    ? obj['recipeIngredient']
+    : Array.isArray(obj['ingredients'])
+    ? obj['ingredients']
     : [];
 
   const ingredients = ingStrings
     .map((s) => parseIngredientLine(String(s)))
-    .filter(Boolean);
+    .filter((ing): ing is Ingredient => Boolean(ing));
 
   const steps = normalizeSteps(stepStrings);
 
   const tags = [
-    ...toStringArray(obj.keywords),
-    ...toStringArray(obj.recipeCategory),
-    ...toStringArray(obj.recipeCuisine),
+    ...toStringArray(obj['keywords']),
+    ...toStringArray(obj['recipeCategory']),
+    ...toStringArray(obj['recipeCuisine']),
   ].map((s) => s.toLowerCase());
 
   return RecipeSchema.parse({
@@ -156,7 +177,10 @@ export function normalizeFromJSONLD(obj, sourceUrl) {
   });
 }
 
-export function normalizeFromHeuristics(data, sourceUrl) {
+export function normalizeFromHeuristics(
+  data: HeuristicExtraction,
+  sourceUrl: string,
+): Recipe {
   const {
     title,
     image,
@@ -165,7 +189,7 @@ export function normalizeFromHeuristics(data, sourceUrl) {
   } = data;
   const ingredients = ingStrings
     .map((s) => parseIngredientLine(String(s)))
-    .filter(Boolean);
+    .filter((ing): ing is Ingredient => Boolean(ing));
   const steps = normalizeSteps(stepStrings);
 
   return RecipeSchema.parse({

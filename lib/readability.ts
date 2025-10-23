@@ -1,7 +1,10 @@
 import { JSDOM } from 'jsdom';
 import { Readability } from '@mozilla/readability';
 
-export const extractReadableContent = (html, url) => {
+export const extractReadableContent = (
+  html: string,
+  url: string,
+): string | null => {
   try {
     const dom = new JSDOM(html, { url });
     const reader = new Readability(dom.window.document);
@@ -9,7 +12,11 @@ export const extractReadableContent = (html, url) => {
     if (!article?.content) return null;
     return article.content;
   } catch (err) {
-    console.warn('[readability] extraction failed', err?.message || err);
+    const message =
+      typeof err === 'object' && err && 'message' in err
+        ? String((err as { message?: unknown }).message)
+        : String(err);
+    console.warn('[readability] extraction failed', message);
     return null;
   }
 };
