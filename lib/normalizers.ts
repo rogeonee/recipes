@@ -27,7 +27,7 @@ const NEUTRAL_UNITS = new Set<string>([
   'can',
 ]);
 
-const inferUnitsFromIngredients = (
+export const inferUnitsFromIngredients = (
   ingredients: Ingredient[],
 ): 'metric' | 'us' => {
   const units = ingredients

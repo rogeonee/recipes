@@ -9,7 +9,9 @@
     "dev": "NODE_ENV=development tsx server.ts"
   },
   "dependencies": {
+    "@ai-sdk/google": "^2.0.23",
     "@mozilla/readability": "^0.5.0",
+    "ai": "^5.0.78",
     "cheerio": "^1.0.0",
     "express": "^4.19.2",
     "he": "^1.2.0",
