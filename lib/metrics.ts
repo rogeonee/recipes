@@ -6,7 +6,7 @@ export type StrategyHit =
   | 'llm-fallback'
   | 'llm-enrich';
 
-type UsageKind = 'extract' | 'enrich';
+type UsageKind = 'extract' | 'enrich' | 'ingredients';
 
 type TokenUsage = {
   inputTokens?: number | null;

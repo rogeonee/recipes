@@ -17,6 +17,7 @@ import {
   getDomain,
   normalizeSteps,
   parseIngredientLine,
+  inferCookMinutesFromSteps,
 } from './recipe-utils.js';
 import { RecipeSchema, type Ingredient, type Recipe } from './recipe-schema.js';
 import { inferUnitsFromIngredients } from './normalizers.js';
@@ -65,6 +66,16 @@ const LLMEnrichmentSchema = z.object({
   cuisines: z.array(z.string().trim().min(1)).optional(),
   methods: z.array(z.string().trim().min(1)).optional(),
 });
+
+const LLMIngredientFixSchema = z.array(
+  z.object({
+    original: z.string(),
+    quantity: z.number().nullable().optional(),
+    unit: z.string().nullable().optional(),
+    item: z.string().nullable().optional(),
+    note: z.string().nullable().optional(),
+  }),
+);
 
 let provider: ReturnType<typeof createGoogleGenerativeAI> | null = null;
 
@@ -182,13 +193,34 @@ const toRecipe = (
     }
   }
 
+  let prep = clampInt(data.prepMinutes);
+  let cook = clampInt(data.cookMinutes);
+  let total = clampInt(
+    data.totalMinutes ??
+      ((data.prepMinutes ?? 0) + (data.cookMinutes ?? 0) || null),
+  );
+
+  const inferredCook = cook ?? inferCookMinutesFromSteps(steps);
+  if (cook == null && inferredCook != null) {
+    cook = clampInt(inferredCook);
+  }
+
+  if (total == null) {
+    if (prep != null && cook != null) {
+      total = clampInt(prep + cook);
+    } else if (cook != null) {
+      total = cook;
+    } else if (prep != null && inferredCook != null) {
+      total = clampInt(prep + inferredCook);
+    } else if (inferredCook != null) {
+      total = clampInt(inferredCook);
+    }
+  }
+
   const time = {
-    prep: clampInt(data.prepMinutes),
-    cook: clampInt(data.cookMinutes),
-    total: clampInt(
-      data.totalMinutes ??
-        ((data.prepMinutes ?? 0) + (data.cookMinutes ?? 0) || null),
-    ),
+    prep,
+    cook,
+    total,
   };
 
   const fetchedAt = new Date().toISOString();
@@ -296,37 +328,48 @@ const callLLM = async <T>({
   schema,
   context,
 }: {
-  kind: 'extract' | 'enrich';
+  kind: 'extract' | 'enrich' | 'ingredients';
   schema: z.ZodType<T>;
   context: string;
 }): Promise<{ object: T; usage: LanguageModelUsage | null }> => {
   const model = loadModel();
   if (!model) throw new Error('LLM model unavailable');
 
-  const systemBase =
-    kind === 'extract'
-      ? [
-          'You are a disciplined recipe extraction engine.',
-          'Extract only facts from the provided context.',
-          'List ingredients with quantity before the item (e.g., "500 g beef chuck").',
-          'Preserve every instruction; keep each step under two concise sentences.',
-          'Identify cooking methods (braise, simmer, grill, sauté, etc.) and dish/category tags.',
-          'Limit optional notes to the most useful facts (maximum three short items).',
-          'If data is absent, respond with null instead of guessing.',
-          'Do not invent numbers or convert units unless stated clearly.',
-          'Output must strictly follow the provided JSON schema.',
-        ].join(' ')
-      : [
-          'You refine existing recipe data with minimal, factual additions.',
-          'Fill only missing fields when the context provides clear evidence.',
-          'List ingredients with quantity before the item if you propose changes.',
-          'Keep all steps present and concise; never drop or merge distinct actions.',
-          'Expand tags with dish type, cuisine, and cooking methods evident from context.',
-          'Limit optional notes to the most useful facts (maximum three short items).',
-          'Never overwrite existing values with guesses or conflicting data.',
-          'Return null for information that remains unknown.',
-          'Output must strictly follow the provided JSON schema.',
-        ].join(' ');
+  const systemBase = (() => {
+    if (kind === 'extract') {
+      return [
+        'You are a disciplined recipe extraction engine.',
+        'Extract only facts from the provided context.',
+        'List ingredients with quantity before the item (e.g., "500 g beef chuck").',
+        'Preserve every instruction; keep each step under two concise sentences.',
+        'Identify cooking methods (braise, simmer, grill, sauté, etc.) and dish/category tags.',
+        'Limit optional notes to the most useful facts (maximum three short items).',
+        'If data is absent, respond with null instead of guessing.',
+        'Do not invent numbers or convert units unless stated clearly.',
+        'Output must strictly follow the provided JSON schema.',
+      ].join(' ');
+    }
+    if (kind === 'enrich') {
+      return [
+        'You refine existing recipe data with minimal, factual additions.',
+        'Fill only missing fields when the context provides clear evidence.',
+        'List ingredients with quantity before the item if you propose changes.',
+        'Keep all steps present and concise; never drop or merge distinct actions.',
+        'Expand tags with dish type, cuisine, and cooking methods evident from context.',
+        'Limit optional notes to the most useful facts (maximum three short items).',
+        'Never overwrite existing values with guesses or conflicting data.',
+        'Return null for information that remains unknown.',
+        'Output must strictly follow the provided JSON schema.',
+      ].join(' ');
+    }
+    return [
+      'You tidy parsed ingredient fields without changing their originals.',
+      'Keep the list order identical and never drop or add ingredients.',
+      'Do not invent numbers or alter the "original" text; only adjust quantity, unit, item, or note for clarity.',
+      'Prefer singular ingredient names (e.g., "thyme" instead of "sprigs thyme"), and move descriptors into the note.',
+      'Return JSON matching the schema exactly.',
+    ].join(' ');
+  })();
 
   let repairHint: string | null = null;
   let lastError: unknown = null;
@@ -406,8 +449,12 @@ export const llmExtractFromHtml = async (params: {
     });
     logLLMUsage('extract', usage);
     const recipe = toRecipe(object, url, heuristics);
-    storeInCache(key, recipe);
-    return recipe;
+    const fixedIngredients = await maybeFixIngredients(recipe.ingredients);
+    const finalRecipe = fixedIngredients
+      ? { ...recipe, ingredients: fixedIngredients }
+      : recipe;
+    storeInCache(key, finalRecipe);
+    return finalRecipe;
   } catch (err) {
     if (err instanceof Error && err.message === 'LLM model unavailable') {
       console.warn('[llm] extract skipped (model unavailable)');
@@ -452,6 +499,84 @@ export const llmEnrichRecipe = async (params: {
       return null;
     }
     console.warn('[llm] enrich failed', err);
+    return null;
+  }
+};
+
+const maybeFixIngredients = async (
+  ingredients: Ingredient[],
+): Promise<Ingredient[] | null> => {
+  const needsFix = ingredients.some((ing) => {
+    if (!ing.item) return true;
+    if (/\(/.test(ing.item) || /\)/.test(ing.item)) return true;
+    if (/\s{2,}/.test(ing.item)) return true;
+    return false;
+  });
+  if (!needsFix) return null;
+
+  const context = [
+    'Review the structured ingredient fields and polish quantity, unit, item, and note.',
+    'Keep the array length and ordering identical and never change the "original" value.',
+    'Leave quantity or unit as null if the source text does not provide a concrete measurement.',
+    `Ingredients JSON:\n${JSON.stringify(ingredients)}`,
+  ].join('\n\n');
+
+  const normalizeString = (value: unknown): string | null => {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const lower = trimmed.toLowerCase();
+    if (lower === 'null' || lower === 'none' || lower === 'n/a') return null;
+    return trimmed;
+  };
+
+  try {
+    const { object, usage } = await callLLM({
+      kind: 'ingredients',
+      schema: LLMIngredientFixSchema,
+      context,
+    });
+    logLLMUsage('ingredients', usage);
+    if (!Array.isArray(object) || object.length !== ingredients.length) {
+      return null;
+    }
+    const adjusted: Ingredient[] = [];
+    for (let i = 0; i < ingredients.length; i += 1) {
+      const base = ingredients[i];
+      const fix = object[i];
+      if (!fix || fix.original !== base.original) {
+        return null;
+      }
+      const quantity =
+        typeof fix.quantity === 'number' && Number.isFinite(fix.quantity)
+          ? fix.quantity
+          : fix.quantity === null
+          ? null
+          : base.quantity;
+      const unit =
+        fix.unit === null
+          ? null
+          : normalizeString(fix.unit) ?? base.unit;
+      const item =
+        fix.item === null
+          ? null
+          : normalizeString(fix.item) ?? base.item;
+      const note =
+        fix.note === null
+          ? null
+          : normalizeString(fix.note) ?? base.note;
+      const next: Ingredient = {
+        ...base,
+        quantity,
+        unit,
+        item,
+        note,
+      };
+      adjusted.push(next);
+    }
+    return adjusted;
+  } catch (err) {
+    console.warn('[llm] ingredient fix failed', err);
     return null;
   }
 };

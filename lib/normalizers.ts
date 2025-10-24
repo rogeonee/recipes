@@ -25,6 +25,10 @@ const NEUTRAL_UNITS = new Set<string>([
   'slice',
   'clove',
   'can',
+  'sprig',
+  'strip',
+  'stalk',
+  'sheet',
 ]);
 
 export const inferUnitsFromIngredients = (
