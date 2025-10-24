@@ -139,6 +139,14 @@ const UNIT_ALIASES = new Map<string, string>([
   ['bunches', 'bunch'],
   ['slice', 'slice'],
   ['slices', 'slice'],
+  ['sprig', 'sprig'],
+  ['sprigs', 'sprig'],
+  ['strip', 'strip'],
+  ['strips', 'strip'],
+  ['stalk', 'stalk'],
+  ['stalks', 'stalk'],
+  ['sheet', 'sheet'],
+  ['sheets', 'sheet'],
 ]);
 
 const normalizeUnit = (u: string | null | undefined): string | null => {
@@ -166,7 +174,13 @@ const UNICODE_FRACTIONS = new Map<string, string>([
 ]);
 
 const replaceUnicodeFractions = (str: string): string =>
-  str.replace(/[½⅓⅔¼¾⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞]/g, (ch) => UNICODE_FRACTIONS.get(ch) || ch);
+  str.replace(/[½⅓⅔¼¾⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞]/g, (ch, offset, src) => {
+    const replacement = UNICODE_FRACTIONS.get(ch) || ch;
+    const prev = offset > 0 ? src[offset - 1] : '';
+    const needsSpace = prev && /\d/.test(prev);
+    const prefix = needsSpace && prev !== ' ' ? ' ' : '';
+    return `${prefix}${replacement}`;
+  });
 
 const numberPattern = '(?:\\d+\\s+\\d+/\\d+|\\d+/\\d+|\\d*\\.\\d+|\\d+)';
 
@@ -197,6 +211,50 @@ const parseNumericToken = (token: string | null | undefined): number | null => {
   }
   const parsed = parseFloat(trimmed);
   return Number.isFinite(parsed) ? parsed : null;
+};
+
+const findCommaOutsideParens = (value: string): number => {
+  let depth = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    const ch = value[i];
+    if (ch === '(') depth += 1;
+    else if (ch === ')' && depth > 0) depth -= 1;
+    else if (ch === ',' && depth === 0) return i;
+  }
+  return -1;
+};
+
+const DURATION_REGEX_SOURCE = `(?:about\\s+|around\\s+|approximately\\s+|at\\s+least\\s+|up\\s+to\\s+|for\\s+|another\\s+|an\\s+additional\\s+|extra\\s+)?(${numberPattern})(?:\\s*(?:-|–|—|to)\\s*(${numberPattern}))?\\s*(hours?|hour|hrs?|hr|h|minutes?|minute|mins?|min|m)\\b`;
+
+const convertDurationMatchToMinutes = (
+  primary: number | null,
+  secondary: number | null,
+  unit: string,
+): number | null => {
+  if (primary == null || !Number.isFinite(primary)) return null;
+  let amount = primary;
+  if (secondary != null && Number.isFinite(secondary)) {
+    amount = (primary + secondary) / 2;
+  }
+  const unitKey = unit.toLowerCase();
+  if (unitKey.startsWith('h')) return amount * 60;
+  if (unitKey.startsWith('m')) return amount;
+  return null;
+};
+
+const collectDurationsFromText = (text: string): number[] => {
+  const normalized = replaceUnicodeFractions(text).toLowerCase();
+  const durationRe = new RegExp(DURATION_REGEX_SOURCE, 'gi');
+  const durations: number[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = durationRe.exec(normalized))) {
+    const primary = parseNumericToken(match[1]);
+    const secondary = match[2] ? parseNumericToken(match[2]) : null;
+    const unit = match[3] ?? '';
+    const minutes = convertDurationMatchToMinutes(primary, secondary, unit);
+    if (minutes != null && Number.isFinite(minutes)) durations.push(minutes);
+  }
+  return durations;
 };
 
 export function parseIngredientLine(line: string): Ingredient | null {
@@ -247,6 +305,18 @@ export function parseIngredientLine(line: string): Ingredient | null {
     }
   }
 
+  rest = rest.trim();
+
+  const leadingNotes: string[] = [];
+  while (rest.startsWith('(')) {
+    const leading = rest.match(/^\(([^()]+)\)\s*/);
+    if (!leading) break;
+    const inner = leading[1].trim();
+    if (inner) leadingNotes.push(inner);
+    rest = rest.slice(leading[0].length).trim();
+  }
+  if (leadingNotes.length) noteParts.push(...leadingNotes);
+
   let unit: string | null = null;
   let item: string | null = rest;
 
@@ -274,6 +344,10 @@ export function parseIngredientLine(line: string): Ingredient | null {
             'pinch',
             'bunch',
             'slice',
+            'sprig',
+            'strip',
+            'stalk',
+            'sheet',
           ].includes(maybeUnit))
       ) {
         unit = maybeUnit;
@@ -281,27 +355,30 @@ export function parseIngredientLine(line: string): Ingredient | null {
       }
     }
   }
-
   if (item) item = item.trim();
 
   if (item) {
-    const comma = item.indexOf(',');
-    if (comma !== -1) {
-      const afterComma = item.slice(comma + 1).trim();
+    while (/\([^()]*\)\s*$/.test(item)) {
+      const match = item.match(/\(([^()]+)\)\s*$/);
+      if (!match) break;
+      const inner = match[1].trim();
+      if (inner) noteParts.push(inner);
+      const matchIndex =
+        typeof match.index === 'number' ? match.index : item.length - match[0].length;
+      item = item.slice(0, matchIndex).trim();
+    }
+  }
+
+  if (item) {
+    const commaIndex = findCommaOutsideParens(item);
+    if (commaIndex !== -1) {
+      const afterComma = item.slice(commaIndex + 1).trim();
       if (afterComma) noteParts.push(afterComma);
-      item = item.slice(0, comma).trim();
+      item = item.slice(0, commaIndex).trim();
     }
   }
 
   if (item && /^of\s+/i.test(item)) item = item.replace(/^of\s+/i, '');
-
-  while (item && /\([^()]*\)\s*$/.test(item)) {
-    const match = item.match(/\(([^()]+)\)\s*$/);
-    if (!match) break;
-    const inner = match[1].trim();
-    if (inner) noteParts.push(inner);
-    item = item.slice(0, match.index).trim();
-  }
 
   if (item) {
     const starMatch = item.match(/\*+$/);
@@ -334,6 +411,22 @@ export function parseIngredientLine(line: string): Ingredient | null {
     note,
   };
 }
+
+export const inferCookMinutesFromSteps = (
+  steps: Recipe['steps'],
+): number | null => {
+  let maxMinutes: number | null = null;
+  for (const step of steps) {
+    const durations = collectDurationsFromText(step.text);
+    for (const minutes of durations) {
+      if (minutes == null || !Number.isFinite(minutes)) continue;
+      if (maxMinutes == null || minutes > maxMinutes) {
+        maxMinutes = minutes;
+      }
+    }
+  }
+  return maxMinutes;
+};
 
 export const isShoutyHeading = (s: string | null | undefined): s is string => {
   if (!s) return false;
