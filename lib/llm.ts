@@ -1,7 +1,12 @@
 import crypto from 'node:crypto';
 
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
-import { generateObject, TypeValidationError, zodSchema } from 'ai';
+import {
+  NoObjectGeneratedError,
+  generateObject,
+  TypeValidationError,
+  zodSchema,
+} from 'ai';
 import type { LanguageModelUsage } from 'ai';
 import * as cheerio from 'cheerio';
 import { z } from 'zod';
@@ -13,18 +18,14 @@ import {
   normalizeSteps,
   parseIngredientLine,
 } from './recipe-utils.js';
-import {
-  RecipeSchema,
-  type Ingredient,
-  type Recipe,
-} from './recipe-schema.js';
+import { RecipeSchema, type Ingredient, type Recipe } from './recipe-schema.js';
 import { inferUnitsFromIngredients } from './normalizers.js';
 import { logLLMUsage } from './metrics.js';
 
 const GOOGLE_MODEL_ID = 'gemini-2.0-flash';
 const REQUEST_TIMEOUT_MS = 8_000;
 const RETRY_TIMEOUT_MS = 12_000;
-const MAX_OUTPUT_TOKENS = 700;
+const MAX_OUTPUT_TOKENS = 1_024;
 const TEMPERATURE = 0.15;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const MAX_CONTEXT_CHARS = 5_000;
@@ -156,10 +157,7 @@ const toRecipe = (
   url: string,
   heuristics?: HeuristicExtraction | null,
 ): Recipe => {
-  const title =
-    data.title ??
-    heuristics?.title ??
-    null;
+  const title = data.title ?? heuristics?.title ?? null;
   const description = data.description ?? null;
   const servings =
     typeof data.servings === 'number' && Number.isFinite(data.servings)
@@ -167,18 +165,14 @@ const toRecipe = (
       : null;
   const yieldOriginal =
     data.servingsText?.trim() ||
-    heuristics?.ingredients?.find((line) =>
-      /\bserves?\b/i.test(line),
-    ) ||
+    heuristics?.ingredients?.find((line) => /\bserves?\b/i.test(line)) ||
     null;
 
   const ingredients: Ingredient[] = (data.ingredients ?? [])
     .map((line) => parseIngredientLine(String(line)))
     .filter((i): i is Ingredient => Boolean(i));
 
-  const steps = normalizeSteps(
-    (data.steps ?? []) as string[],
-  );
+  const steps = normalizeSteps((data.steps ?? []) as string[]);
 
   const tagsSet = new Set<string>();
   for (const collection of [data.tags, data.cuisines, data.methods]) {
@@ -231,7 +225,11 @@ const mergeEnrichment = (
   enrichment: z.infer<typeof LLMEnrichmentSchema>,
 ): Recipe => {
   const mergedTags = new Set<string>(base.tags);
-  for (const block of [enrichment.tags, enrichment.cuisines, enrichment.methods]) {
+  for (const block of [
+    enrichment.tags,
+    enrichment.cuisines,
+    enrichment.methods,
+  ]) {
     for (const tag of block ?? []) {
       const clean = tag.trim().toLowerCase();
       if (clean) mergedTags.add(clean);
@@ -310,6 +308,10 @@ const callLLM = async <T>({
       ? [
           'You are a disciplined recipe extraction engine.',
           'Extract only facts from the provided context.',
+          'List ingredients with quantity before the item (e.g., "500 g beef chuck").',
+          'Preserve every instruction; keep each step under two concise sentences.',
+          'Identify cooking methods (braise, simmer, grill, sauté, etc.) and dish/category tags.',
+          'Limit optional notes to the most useful facts (maximum three short items).',
           'If data is absent, respond with null instead of guessing.',
           'Do not invent numbers or convert units unless stated clearly.',
           'Output must strictly follow the provided JSON schema.',
@@ -317,6 +319,10 @@ const callLLM = async <T>({
       : [
           'You refine existing recipe data with minimal, factual additions.',
           'Fill only missing fields when the context provides clear evidence.',
+          'List ingredients with quantity before the item if you propose changes.',
+          'Keep all steps present and concise; never drop or merge distinct actions.',
+          'Expand tags with dish type, cuisine, and cooking methods evident from context.',
+          'Limit optional notes to the most useful facts (maximum three short items).',
           'Never overwrite existing values with guesses or conflicting data.',
           'Return null for information that remains unknown.',
           'Output must strictly follow the provided JSON schema.',
@@ -324,17 +330,19 @@ const callLLM = async <T>({
 
   let repairHint: string | null = null;
   let lastError: unknown = null;
+  let contextForAttempt = context;
 
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const shrinkContext = (value: string) =>
+    value.length > 3_500 ? value.slice(0, 3_500) : value;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
     const timeoutMs = attempt === 0 ? REQUEST_TIMEOUT_MS : RETRY_TIMEOUT_MS;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const promptParts = [context];
+      const promptParts = [contextForAttempt];
       if (repairHint) {
-        promptParts.push(
-          `Previous output failed validation: ${repairHint}`,
-        );
+        promptParts.push(`Previous output failed validation: ${repairHint}`);
         promptParts.push('Return corrected JSON only.');
       }
 
@@ -363,11 +371,13 @@ const callLLM = async <T>({
         repairHint = err.message;
         continue;
       }
-      if (
-        err instanceof Error &&
-        err.name === 'AbortError' &&
-        attempt === 0
-      ) {
+      if (err instanceof NoObjectGeneratedError) {
+        repairHint =
+          'Previous response was truncated or not valid JSON. Return compact JSON only, fully close arrays/objects, and keep each step under 35 words.';
+        contextForAttempt = shrinkContext(contextForAttempt);
+        continue;
+      }
+      if (err instanceof Error && err.name === 'AbortError' && attempt < 2) {
         continue;
       }
     }

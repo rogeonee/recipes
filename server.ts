@@ -5,6 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { fetch } from 'undici';
 import * as cheerio from 'cheerio';
+import 'dotenv/config';
 
 import {
   extractHeuristics,
@@ -44,7 +45,9 @@ const hasStructuredBits = (
 ): result is HeuristicExtraction | Recipe =>
   (result?.ingredients?.length || 0) > 0 && (result?.steps?.length || 0) > 0;
 
-const isRecipeComplete = (recipe: Recipe | null | undefined): recipe is Recipe =>
+const isRecipeComplete = (
+  recipe: Recipe | null | undefined,
+): recipe is Recipe =>
   Boolean(recipe) &&
   (recipe.ingredients?.length || 0) > 0 &&
   (recipe.steps?.length || 0) > 0;
